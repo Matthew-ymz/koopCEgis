@@ -5,6 +5,7 @@ import math
 from typing import Union
 from sklearn.preprocessing import MaxAbsScaler, StandardScaler
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -3302,6 +3303,153 @@ def compute_gis_metrics(A, Sigma, alpha=1.0, eps=1e-10):
     }
 
 
+def plot_dual_gis_spectrum(
+    forward_values,
+    backward_values,
+    title,
+    forward_label="$\\Sigma^{-1}$",
+    backward_label="$A^T\\Sigma^{-1}A$",
+):
+    """
+    在同一坐标轴上绘制 GIS 的前向谱与后向谱。
+
+    Parameters
+    ----------
+    forward_values : array-like
+        前向矩阵（通常为 Sigma^{-1}）的奇异值谱。
+    backward_values : array-like
+        后向矩阵（通常为 A^T Sigma^{-1} A）的奇异值谱。
+    title : str
+        图标题。
+    forward_label, backward_label : str
+        两组谱的图例标签。
+    """
+    forward_values = np.asarray(forward_values, dtype=float).ravel()
+    backward_values = np.asarray(backward_values, dtype=float).ravel()
+    k = max(len(forward_values), len(backward_values))
+    x = np.arange(1, k + 1)
+    width = 0.36
+
+    forward_plot = np.full(k, np.nan)
+    backward_plot = np.full(k, np.nan)
+    forward_plot[: len(forward_values)] = forward_values
+    backward_plot[: len(backward_values)] = backward_values
+
+    fig, ax = plt.subplots(figsize=(7.6, 4.4))
+    ax.bar(
+        x - width / 2,
+        forward_plot,
+        width=width,
+        color="tab:blue",
+        alpha=0.45,
+        label=forward_label,
+    )
+    ax.bar(
+        x + width / 2,
+        backward_plot,
+        width=width,
+        color="tab:orange",
+        alpha=0.45,
+        label=backward_label,
+    )
+    ax.plot(x - width / 2, forward_plot, color="tab:blue", marker="o", linewidth=1.8)
+    ax.plot(
+        x + width / 2,
+        backward_plot,
+        color="tab:orange",
+        marker="s",
+        linewidth=1.8,
+    )
+    ax.set_title(title)
+    ax.set_xlabel("i")
+    ax.set_ylabel("SVD")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_gis_spectrum(
+    forward_values,
+    backward_values,
+    title,
+    forward_label="$\\Sigma^{-1}$",
+    backward_label="$A^T\\Sigma^{-1}A$",
+    horizontal_line_value=None,
+):
+    """
+    将 GIS 的前向谱与后向谱合并排序后绘图。
+
+    Parameters
+    ----------
+    forward_values : array-like
+        前向矩阵奇异值谱。
+    backward_values : array-like
+        后向矩阵奇异值谱。
+    title : str
+        图标题。
+    forward_label, backward_label : str
+        两组谱的图例标签。
+    horizontal_line_value : float or None
+        若给定，则额外绘制一条水平参考线。
+    """
+    forward_values = np.asarray(forward_values, dtype=float).ravel()
+    backward_values = np.asarray(backward_values, dtype=float).ravel()
+
+    forward_data = [(value, "forward") for value in forward_values]
+    backward_data = [(value, "backward") for value in backward_values]
+    combined_data = forward_data + backward_data
+    combined_data.sort(key=lambda x: x[0], reverse=True)
+
+    sorted_values = [item[0] for item in combined_data]
+    sorted_labels = [item[1] for item in combined_data]
+    x = np.arange(1, len(sorted_values) + 1)
+
+    fig, ax = plt.subplots(figsize=(7.6, 4.4))
+    for i, value in enumerate(sorted_values):
+        if sorted_labels[i] == "forward":
+            ax.bar(x[i], value, color="tab:blue", alpha=0.45)
+        else:
+            ax.bar(x[i], value, color="tab:orange", alpha=0.45)
+
+    blue_patch = Line2D(
+        [0],
+        [0],
+        marker="o",
+        color="w",
+        markerfacecolor="tab:blue",
+        markersize=10,
+        label=forward_label,
+    )
+    orange_patch = Line2D(
+        [0],
+        [0],
+        marker="o",
+        color="w",
+        markerfacecolor="tab:orange",
+        markersize=10,
+        label=backward_label,
+    )
+
+    ax.set_title(title)
+    ax.set_xlabel("Index")
+    ax.set_ylabel("Values")
+    ax.legend(handles=[blue_patch, orange_patch])
+
+    if horizontal_line_value is not None:
+        ax.axhline(y=horizontal_line_value, color="gray", linestyle="--")
+        ax.text(
+            x=len(sorted_values),
+            y=horizontal_line_value,
+            s=f"Value = {horizontal_line_value}",
+            color="gray",
+            va="bottom",
+            ha="right",
+        )
+
+    plt.tight_layout()
+    plt.show()
+
+
 def predict_linear_gis(A, X0, steps=1):
     """
     基于线性 GIS 做一步或多步预测。
@@ -3526,42 +3674,93 @@ def build_w_from_svd(A, Sigma, r=None, alpha=1.0, eps=1e-10, mode='two_stage'):
     sv_forward = metrics["sv_forward"]
     sv_backward = metrics["sv_backward"]
 
-    if r is None:
-        r, _ = select_macro_rank(sv_backward, mode='gap', eps=eps)
-    r = int(r)
-
     if mode == 'backward_only':
-        U_b, _, _ = np.linalg.svd(backward, full_matrices=False)
-        basis = U_b[:, :r]
-    elif mode == 'two_stage':
-        U_f, S_f, _ = np.linalg.svd(sigma_inv, full_matrices=False)
         U_b, S_b, _ = np.linalg.svd(backward, full_matrices=False)
+        rank_auto = int(np.sum(np.asarray(S_b) > eps))
+        if rank_auto <= 0:
+            raise ValueError("backward_only 模式下没有超过阈值 eps 的有效方向")
+        r_final = rank_auto if r is None else int(r)
+        r_final = max(1, min(r_final, U_b.shape[1]))
+        basis = U_b[:, :r_final]
+        W = basis.T
+        return {
+            "W": np.real_if_close(W),
+            "r": r_final,
+            "sv_info": {
+                "sv_forward": np.real_if_close(sv_forward),
+                "sv_backward": np.real_if_close(sv_backward),
+            },
+            "basis_info": {
+                "mode": mode,
+                "basis": np.real_if_close(basis),
+            },
+        }
+    elif mode == 'two_stage':
+        U_det, S_det, _ = np.linalg.svd(sigma_inv, full_matrices=False)
+        U_nondeg, S_nondeg, _ = np.linalg.svd(backward, full_matrices=False)
 
-        combined_vectors = np.concatenate([U_f, U_b], axis=1)
-        combined_scores = np.concatenate([S_f, S_b], axis=0)
-        keep = combined_scores > eps
-        combined_vectors = combined_vectors[:, keep]
-        combined_scores = combined_scores[keep]
-        if combined_vectors.shape[1] == 0:
-            raise ValueError("SVD two_stage 模式下没有可用主方向")
+        combined_scores = np.concatenate([S_nondeg, S_det], axis=0)
+        combined_vectors = np.concatenate([U_nondeg, U_det], axis=1)
+        source_labels = np.array(
+            ['nondeg'] * len(S_nondeg) + ['det'] * len(S_det),
+            dtype=object,
+        )
 
-        weighted_vectors = combined_vectors * combined_scores
-        U_c, _, _ = np.linalg.svd(weighted_vectors, full_matrices=False)
-        basis = U_c[:, :r]
+        order = np.argsort(-combined_scores)
+        S_all = combined_scores[order]
+        U_all = combined_vectors[:, order]
+        source_all = source_labels[order]
+
+        keep_stage1 = S_all > eps
+        if not np.any(keep_stage1):
+            raise ValueError("two_stage 模式下第一次截断后没有保留下任何方向")
+
+        U_bar = U_all[:, keep_stage1]
+        S_bar = S_all[keep_stage1]
+        source_bar = source_all[keep_stage1]
+        weighted_matrix = U_bar @ np.diag(S_bar)
+
+        U2, S2, _ = np.linalg.svd(weighted_matrix, full_matrices=False)
+        rank_stage2_auto = int(np.sum(np.asarray(S2) > eps))
+        if rank_stage2_auto <= 0:
+            raise ValueError("two_stage 模式下第二次截断后没有保留下任何方向")
+
+        r_final = rank_stage2_auto if r is None else int(r)
+        r_final = max(1, min(r_final, U2.shape[1]))
+        basis = U2[:, :r_final]
     else:
         raise ValueError(f"不支持的 SVD W 构造模式: {mode}")
 
     W = basis.T
     return {
         "W": np.real_if_close(W),
-        "r": r,
+        "r": r_final,
         "sv_info": {
             "sv_forward": np.real_if_close(sv_forward),
             "sv_backward": np.real_if_close(sv_backward),
+            "sv_det": np.real_if_close(S_det),
+            "sv_nondeg": np.real_if_close(S_nondeg),
+            "sv_all": np.real_if_close(S_all),
+            "sv_stage2": np.real_if_close(S2),
         },
         "basis_info": {
             "mode": mode,
             "basis": np.real_if_close(basis),
+            "U_det": np.real_if_close(U_det),
+            "U_nondeg": np.real_if_close(U_nondeg),
+            "U_all": np.real_if_close(U_all),
+            "U_bar": np.real_if_close(U_bar),
+            "U2": np.real_if_close(U2),
+            "weighted_matrix": np.real_if_close(weighted_matrix),
+            "source_all": source_all.tolist(),
+            "source_bar": source_bar.tolist(),
+        },
+        "stage_info": {
+            "eps": float(eps),
+            "rank_stage1": int(U_bar.shape[1]),
+            "rank_stage2_auto": rank_stage2_auto,
+            "r_final": r_final,
+            "manual_r_applied": r is not None,
         },
     }
 
