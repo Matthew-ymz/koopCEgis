@@ -1,11 +1,15 @@
 import pysindy as ps
+from pathlib import Path
 from sklearn.metrics import mean_squared_error
 from tqdm import tqdm
 import math
-from typing import Union
+from typing import Iterable, Sequence, Union
 from sklearn.preprocessing import MaxAbsScaler, StandardScaler
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib import cm
+from matplotlib.colors import LinearSegmentedColormap, Normalize
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -3921,3 +3925,1208 @@ def summarize_pipeline_results(
     }
 
     return summary_dict, summary_row
+
+
+# ============================================================================
+# Analytical noisy parabolic-map and Part-3 noise-scan helpers.
+# These helpers were consolidated from exp/analysitic/noisy_parabolic_map.py and
+# exp/analysitic/noise_scan_part3.py so notebooks can import them from tools.py.
+# ============================================================================
+
+State = Sequence[float]
+
+FEATURE_NAMES = ["$x$", "$y$", "$x^2$"]
+A_SCAN_VALUES = [0.0, 0.01, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0, 2.0, 5.0, 8.0, 10.0]
+A_SUMMARY_VALUES = [0.2, 0.4, 0.5, 0.6, 0.8, 1.0]
+B_SCAN_VALUES = [0.0, 0.01, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0]
+AB_SCAN_VALUES = [
+    (0.1, 0.0),
+    (0.2, 0.05),
+    (0.4, 0.1),
+    (0.5, 0.2),
+    (0.6, 0.2),
+    (0.8, 0.2),
+    (1.0, 0.2),
+    (1.0, 0.4),
+    (2.0, 0.5),
+    (2.0, 0.8),
+    (5.0, 1.0),
+    (8.0, 1.0),
+    (10.0, 1.0),
+]
+C_A_VALUES = [0.5, 1.0, 2.0, 5.0, 8.0, 10.0]
+C_B_VALUES = [0.0, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0]
+DEFAULT_CONFIG = {
+    "lam": 0.1,
+    "mu": 0.9,
+    "initial_state": [5.0, 5.0],
+    "steps": 600,
+    "dt": 1.0,
+    "tau": 1,
+    "alpha": 1.0,
+    "noise_seed": 42,
+    "metrics_eps": 1e-10,
+    "manual_r": 1,
+    "horizons": (1, 3, 5),
+}
+
+
+def simulate_noisy_parabolic_map(
+    initial_state: State,
+    steps: int,
+    lam: float,
+    mu: float,
+    noise_scale: float = 0.0,
+    seed: int | np.random.SeedSequence | None = None,
+) -> np.ndarray:
+    """Simulate one trajectory of the noisy two-dimensional parabolic map."""
+    if steps < 0:
+        raise ValueError("steps must be nonnegative")
+    if noise_scale < 0:
+        raise ValueError("noise_scale must be nonnegative")
+
+    state = np.asarray(initial_state, dtype=float)
+    if state.shape != (2,):
+        raise ValueError("initial_state must contain exactly two values")
+
+    trajectory = np.empty((steps + 1, 2), dtype=float)
+    trajectory[0] = state
+    rng = np.random.default_rng(seed)
+
+    for k in range(steps):
+        x, y = trajectory[k]
+        next_state = np.array([lam * x, mu * y + (lam**2 - mu) * x**2], dtype=float)
+        if noise_scale > 0:
+            next_state += rng.normal(loc=0.0, scale=noise_scale, size=2)
+        trajectory[k + 1] = next_state
+
+    return trajectory
+
+
+def simulate_many_trajectories(
+    initial_states: Iterable[State],
+    steps: int,
+    lam: float,
+    mu: float,
+    noise_scale: float = 0.0,
+    seed: int | None = None,
+) -> np.ndarray:
+    """Simulate multiple trajectories with reproducible independent noise streams."""
+    initial_states = list(initial_states)
+    if not initial_states:
+        raise ValueError("initial_states must not be empty")
+
+    seed_sequence = np.random.SeedSequence(seed)
+    child_sequences = seed_sequence.spawn(len(initial_states))
+    trajectories = [
+        simulate_noisy_parabolic_map(
+            initial_state=initial_state,
+            steps=steps,
+            lam=lam,
+            mu=mu,
+            noise_scale=noise_scale,
+            seed=child_sequence,
+        )
+        for initial_state, child_sequence in zip(initial_states, child_sequences)
+    ]
+    return np.stack(trajectories, axis=0)
+
+
+def make_initial_state_grid(x_values: Sequence[float], y_values: Sequence[float]) -> list[tuple[float, float]]:
+    """Return a Cartesian grid of phase-space initial states."""
+    return [(float(x), float(y)) for y in y_values for x in x_values]
+
+
+def summarize_noisy_parabolic_trajectories(
+    trajectories: np.ndarray,
+    initial_states: Sequence[State],
+) -> pd.DataFrame:
+    """Return trajectory-level radius and endpoint summaries."""
+    trajectories = np.asarray(trajectories, dtype=float)
+    if trajectories.ndim != 3 or trajectories.shape[-1] != 2:
+        raise ValueError("trajectories must have shape (n_trajectories, steps + 1, 2)")
+    if len(initial_states) != trajectories.shape[0]:
+        raise ValueError("initial_states length must match the number of trajectories")
+
+    radii = np.linalg.norm(trajectories, axis=2)
+    return pd.DataFrame(
+        {
+            "initial_x": [state[0] for state in initial_states],
+            "initial_y": [state[1] for state in initial_states],
+            "initial_radius": radii[:, 0],
+            "final_x": trajectories[:, -1, 0],
+            "final_y": trajectories[:, -1, 1],
+            "max_radius": radii.max(axis=1),
+            "final_radius": radii[:, -1],
+        }
+    )
+
+
+def compute_noisy_parabolic_observation_matrices(
+    trajectories: np.ndarray,
+    lam: float,
+    mu: float,
+    observable_mode: str = "default",
+) -> dict[str, np.ndarray | list[str]]:
+    """Compute analytic observation dynamics and empirical observable covariance."""
+    trajectories = np.asarray(trajectories, dtype=float)
+    if trajectories.ndim != 3 or trajectories.shape[-1] != 2:
+        raise ValueError("trajectories must have shape (n_trajectories, steps + 1, 2)")
+
+    flat_states = trajectories.reshape(-1, trajectories.shape[-1])
+    observations = observable_step(flat_states, mode=observable_mode)
+    covariance = np.cov(observations, rowvar=False, ddof=1)
+    return {
+        "A": make_step_system_matrix(lam=lam, mu=mu),
+        "covariance": np.asarray(covariance, dtype=float),
+        "observations": observations,
+        "feature_names": list(FEATURE_NAMES),
+    }
+
+
+def configure_noisy_parabolic_publication_style() -> None:
+    """Apply compact publication-style matplotlib defaults for this notebook figure."""
+    mpl.rcParams.update(
+        {
+            "font.family": "sans-serif",
+            "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans", "sans-serif"],
+            "font.size": 7.0,
+            "axes.labelsize": 7.2,
+            "axes.titlesize": 7.4,
+            "xtick.labelsize": 6.4,
+            "ytick.labelsize": 6.4,
+            "legend.fontsize": 6.2,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.linewidth": 0.7,
+            "xtick.major.width": 0.6,
+            "ytick.major.width": 0.6,
+            "xtick.major.size": 2.6,
+            "ytick.major.size": 2.6,
+            "legend.frameon": False,
+            "figure.dpi": 150,
+            "savefig.dpi": 600,
+            "svg.fonttype": "none",
+            "pdf.fonttype": 42,
+            "axes.unicode_minus": False,
+        }
+    )
+
+
+def _add_panel_label(ax: plt.Axes, label: str) -> None:
+    ax.text(
+        -0.16,
+        1.06,
+        label,
+        transform=ax.transAxes,
+        fontsize=8.0,
+        fontweight="bold",
+        va="top",
+        ha="left",
+    )
+
+
+def save_publication_figure(
+    fig: plt.Figure,
+    output_base: str | Path,
+    formats: Sequence[str] = ("svg", "pdf", "png", "tiff"),
+) -> dict[str, Path]:
+    """Save a publication figure in vector and high-resolution raster formats."""
+    output_base = Path(output_base)
+    output_base.parent.mkdir(parents=True, exist_ok=True)
+    saved = {}
+    for ext in formats:
+        path = output_base.with_suffix(f".{ext}")
+        kwargs = {"bbox_inches": "tight"}
+        if ext in {"png", "tiff"}:
+            kwargs["dpi"] = 600
+        fig.savefig(path, **kwargs)
+        saved[ext] = path
+    return saved
+
+
+def plot_noisy_parabolic_observation_matrices(
+    A: np.ndarray,
+    covariance: np.ndarray,
+    feature_names: Sequence[str] = FEATURE_NAMES,
+    output_base: str | Path | None = None,
+    formats: Sequence[str] = ("svg", "pdf", "png", "tiff"),
+    figsize: tuple[float, float] = (5.70, 2.60),
+) -> tuple[plt.Figure, dict[str, plt.Axes], dict[str, Path]]:
+    """Visualize observation-space dynamics and covariance matrices."""
+    A = np.asarray(A, dtype=float)
+    covariance = np.asarray(covariance, dtype=float)
+    if A.shape[0] != A.shape[1]:
+        raise ValueError("A must be a square matrix")
+    if covariance.shape != A.shape:
+        raise ValueError("covariance must have the same shape as A")
+    if len(feature_names) != A.shape[0]:
+        raise ValueError("feature_names length must match matrix dimensions")
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize, constrained_layout=True)
+    ax_a, ax_cov = axes
+    max_abs_a = max(float(np.max(np.abs(A))) if A.size else 1.0, 1e-12)
+    max_abs_cov = max(float(np.max(np.abs(covariance))) if covariance.size else 1.0, 1e-12)
+
+    im_a = ax_a.imshow(A, cmap="RdBu_r", vmin=-max_abs_a, vmax=max_abs_a)
+    im_cov = ax_cov.imshow(covariance, cmap="BrBG", vmin=-max_abs_cov, vmax=max_abs_cov)
+
+    for ax, matrix, title in [
+        (ax_a, A, r"Observation dynamics $A$"),
+        (ax_cov, covariance, r"Observable covariance"),
+    ]:
+        ax.set_title(title, loc="left", pad=5)
+        ax.set_xticks(np.arange(len(feature_names)), labels=feature_names)
+        ax.set_yticks(np.arange(len(feature_names)), labels=feature_names)
+        ax.tick_params(length=0)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.set_xticks(np.arange(-0.5, len(feature_names), 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, len(feature_names), 1), minor=True)
+        ax.grid(which="minor", color="white", linewidth=0.8)
+        ax.tick_params(which="minor", bottom=False, left=False)
+        for row in range(matrix.shape[0]):
+            for col in range(matrix.shape[1]):
+                value = matrix[row, col]
+                display_value = 0.0 if abs(value) < 5e-4 else value
+                text_color = "white" if abs(value) > 0.55 * np.max(np.abs(matrix)) else "0.18"
+                ax.text(col, row, f"{display_value:.2f}", ha="center", va="center", fontsize=6.1, color=text_color)
+
+    ax_a.set_xlabel(r"Current observable $\psi_k$")
+    ax_a.set_ylabel(r"Next observable $\psi_{k+1}$")
+    ax_cov.set_xlabel(r"Observable $\psi$")
+    ax_cov.set_ylabel(r"Observable $\psi$")
+    _add_panel_label(ax_a, "a")
+    _add_panel_label(ax_cov, "b")
+
+    cbar_a = fig.colorbar(im_a, ax=ax_a, fraction=0.046, pad=0.03)
+    cbar_cov = fig.colorbar(im_cov, ax=ax_cov, fraction=0.046, pad=0.03)
+    cbar_a.ax.tick_params(labelsize=5.8, width=0.45, length=2.0)
+    cbar_cov.ax.tick_params(labelsize=5.8, width=0.45, length=2.0)
+    cbar_a.outline.set_linewidth(0.45)
+    cbar_cov.outline.set_linewidth(0.45)
+
+    saved = {}
+    if output_base is not None:
+        saved = save_publication_figure(fig, output_base, formats=formats)
+    return fig, {"A": ax_a, "covariance": ax_cov}, saved
+
+
+def plot_noisy_parabolic_publication_figure(
+    trajectories: np.ndarray,
+    initial_states: Sequence[State],
+    lam: float,
+    mu: float,
+    noise_scale: float,
+    output_base: str | Path | None = None,
+    formats: Sequence[str] = ("svg", "pdf", "png", "tiff"),
+    figsize: tuple[float, float] = (7.20, 4.15),
+) -> tuple[plt.Figure, dict[str, plt.Axes], dict[str, Path]]:
+    """Create the three-panel noisy parabolic-map phase-space figure."""
+    trajectories = np.asarray(trajectories, dtype=float)
+    if trajectories.ndim != 3 or trajectories.shape[-1] != 2:
+        raise ValueError("trajectories must have shape (n_trajectories, steps + 1, 2)")
+
+    initial_states = np.asarray(initial_states, dtype=float)
+    radii = np.linalg.norm(trajectories, axis=2)
+    initial_radius = radii[:, 0]
+    final_radius = radii[:, -1]
+    steps = np.arange(trajectories.shape[1])
+
+    cmap = LinearSegmentedColormap.from_list(
+        "initial_radius_blue",
+        ["#d9e2ec", "#6f9eb6", "#1f5d7a"],
+    )
+    norm = Normalize(vmin=float(initial_radius.min()), vmax=float(initial_radius.max()))
+    colors = cmap(norm(initial_radius))
+
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    gs = fig.add_gridspec(
+        2,
+        3,
+        width_ratios=(1.42, 0.93, 0.82),
+        height_ratios=(1.0, 0.92),
+    )
+    ax_phase = fig.add_subplot(gs[:, 0])
+    ax_radius = fig.add_subplot(gs[0, 1:])
+    ax_final = fig.add_subplot(gs[1, 1:])
+
+    for idx, trajectory in enumerate(trajectories):
+        ax_phase.plot(
+            trajectory[:, 0],
+            trajectory[:, 1],
+            color=colors[idx],
+            linewidth=1.15,
+            alpha=0.88,
+            solid_capstyle="round",
+        )
+        ax_phase.scatter(
+            trajectory[0, 0],
+            trajectory[0, 1],
+            s=22,
+            facecolor="white",
+            edgecolor=colors[idx],
+            linewidth=0.9,
+            zorder=4,
+        )
+        ax_phase.scatter(
+            trajectory[-1, 0],
+            trajectory[-1, 1],
+            s=24,
+            marker="x",
+            color=colors[idx],
+            linewidth=0.9,
+            zorder=4,
+        )
+
+    x_min, x_max = trajectories[:, :, 0].min(), trajectories[:, :, 0].max()
+    x_curve = np.linspace(x_min, x_max, 400)
+    invariant = x_curve**2
+    y_lower = trajectories[:, :, 1].min() - 0.10
+    y_upper = trajectories[:, :, 1].max() + 0.12
+    visible = invariant <= y_upper
+    ax_phase.plot(
+        x_curve[visible],
+        invariant[visible],
+        color="0.36",
+        linewidth=0.85,
+        linestyle=(0, (2.0, 2.0)),
+        alpha=0.75,
+        zorder=1,
+    )
+    ax_phase.axhline(0, color="0.82", linewidth=0.55, zorder=0)
+    ax_phase.axvline(0, color="0.82", linewidth=0.55, zorder=0)
+    ax_phase.set_xlim(x_min - 0.08, x_max + 0.08)
+    ax_phase.set_ylim(y_lower, y_upper)
+    ax_phase.set_aspect("equal", adjustable="box")
+    ax_phase.set_xlabel(r"$x_k$")
+    ax_phase.set_ylabel(r"$y_k$")
+    ax_phase.set_title("Noisy phase portrait", loc="left", pad=4)
+    ax_phase.text(
+        0.03,
+        0.04,
+        r"reference: $y=x^2$",
+        transform=ax_phase.transAxes,
+        color="0.34",
+        fontsize=6.2,
+        ha="left",
+        va="bottom",
+    )
+    marker_handles = [
+        Line2D([0], [0], marker="o", color="0.35", markerfacecolor="white", linestyle="None", markersize=4.0, label="initial"),
+        Line2D([0], [0], marker="x", color="0.35", linestyle="None", markersize=4.3, label="final"),
+    ]
+    ax_phase.legend(
+        handles=marker_handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=2,
+        borderaxespad=0.0,
+        handletextpad=0.35,
+        columnspacing=0.85,
+    )
+    cbar = fig.colorbar(
+        mpl.cm.ScalarMappable(norm=norm, cmap=cmap),
+        ax=ax_phase,
+        location="right",
+        fraction=0.055,
+        pad=0.03,
+    )
+    cbar.set_label("Initial radius", rotation=90, labelpad=6)
+    cbar.outline.set_linewidth(0.45)
+    cbar.ax.tick_params(width=0.45, length=2.0, labelsize=6.0)
+
+    radius_for_plot = radii.copy()
+    radius_for_plot[radius_for_plot <= 0] = np.nan
+    for idx in np.argsort(initial_radius):
+        ax_radius.plot(
+            steps,
+            radius_for_plot[idx],
+            color=colors[idx],
+            linewidth=0.75,
+            alpha=0.45,
+        )
+    median_radius = np.nanmedian(radius_for_plot, axis=0)
+    q25, q75 = np.nanpercentile(radius_for_plot, [25, 75], axis=0)
+    ax_radius.fill_between(steps, q25, q75, color="#c8d7e2", alpha=0.50, linewidth=0)
+    ax_radius.plot(steps, median_radius, color="#1f5d7a", linewidth=1.55, label="median")
+    ax_radius.axhline(noise_scale, color="#a65f3b", linewidth=0.8, linestyle=(0, (3, 2)))
+    ax_radius.text(
+        0.985,
+        noise_scale * 1.18,
+        "noise scale",
+        transform=ax_radius.get_yaxis_transform(),
+        color="#8a4c2e",
+        fontsize=6.0,
+        ha="right",
+        va="bottom",
+    )
+    ax_radius.set_yscale("log")
+    ax_radius.set_xlim(0, steps[-1])
+    ax_radius.set_ylim(0.004, max(1.8, np.nanmax(radius_for_plot) * 1.05))
+    ax_radius.set_ylabel(r"$\|\mathbf{s}_k\|_2$")
+    ax_radius.set_xlabel("Iteration")
+    ax_radius.set_title("Contraction to a noise-limited radius", loc="left", pad=4)
+    ax_radius.grid(axis="y", color="0.90", linewidth=0.45)
+
+    order = np.argsort(initial_radius)
+    ax_final.scatter(
+        initial_radius[order],
+        final_radius[order],
+        s=24,
+        c=colors[order],
+        edgecolor="white",
+        linewidth=0.45,
+        zorder=3,
+    )
+    mean_final = float(np.mean(final_radius))
+    sd_final = float(np.std(final_radius, ddof=1))
+    ax_final.axhspan(
+        max(mean_final - sd_final, 1e-5),
+        mean_final + sd_final,
+        color="#c8d7e2",
+        alpha=0.45,
+        linewidth=0,
+    )
+    ax_final.axhline(mean_final, color="#1f5d7a", linewidth=1.2)
+    ax_final.axhline(noise_scale, color="#a65f3b", linewidth=0.8, linestyle=(0, (3, 2)))
+    ax_final.text(
+        0.99,
+        mean_final * 1.12,
+        "mean final radius",
+        transform=ax_final.get_yaxis_transform(),
+        color="#1f5d7a",
+        fontsize=6.0,
+        ha="right",
+        va="bottom",
+    )
+    ax_final.set_yscale("log")
+    ax_final.set_xlim(-0.05, initial_radius.max() + 0.10)
+    ax_final.set_ylim(0.004, max(0.09, final_radius.max() * 1.45))
+    ax_final.set_xlabel(r"Initial radius $\|\mathbf{s}_0\|_2$")
+    ax_final.set_ylabel(r"Final radius $\|\mathbf{s}_{90}\|_2$")
+    ax_final.set_title("Final spread is small across starting states", loc="left", pad=4)
+    ax_final.grid(axis="y", color="0.90", linewidth=0.45)
+
+    for label, ax in zip("abc", (ax_phase, ax_radius, ax_final)):
+        _add_panel_label(ax, label)
+
+    subtitle = rf"$\lambda={lam:.2f}$, $\mu={mu:.2f}$, noise scale = {noise_scale:.3f}, n = {len(initial_states)} trajectories"
+    fig.suptitle(subtitle, x=0.02, y=1.02, ha="left", va="bottom", fontsize=7.1)
+
+    saved = {}
+    if output_base is not None:
+        saved = save_publication_figure(fig, output_base, formats=formats)
+    return fig, {"phase": ax_phase, "radius": ax_radius, "final": ax_final}, saved
+
+
+def plot_phase_space_trajectories(
+    trajectories: np.ndarray,
+    initial_states: Sequence[State] | None = None,
+    figsize: tuple[float, float] = (8.0, 5.6),
+    alpha: float = 0.88,
+    linewidth: float = 1.35,
+    marker_size: float = 14.0,
+    output_path: str | Path | None = None,
+) -> tuple[plt.Figure, plt.Axes]:
+    """Plot phase-space trajectories with the legend outside the axes."""
+    trajectories = np.asarray(trajectories, dtype=float)
+    if trajectories.ndim != 3 or trajectories.shape[-1] != 2:
+        raise ValueError("trajectories must have shape (n_trajectories, steps + 1, 2)")
+
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    colors = plt.cm.viridis(np.linspace(0.08, 0.92, trajectories.shape[0]))
+    for idx, trajectory in enumerate(trajectories):
+        label = f"traj {idx + 1}"
+        if initial_states is not None:
+            x0, y0 = initial_states[idx]
+            label = f"({x0:.2g}, {y0:.2g})"
+        ax.plot(trajectory[:, 0], trajectory[:, 1], color=colors[idx], linewidth=linewidth, alpha=alpha, label=label)
+        ax.scatter(trajectory[0, 0], trajectory[0, 1], color=colors[idx], s=marker_size, marker="o", zorder=3)
+        ax.scatter(trajectory[-1, 0], trajectory[-1, 1], color=colors[idx], s=marker_size, marker="x", zorder=3)
+
+    ax.axhline(0.0, color="0.76", linewidth=0.8, zorder=0)
+    ax.axvline(0.0, color="0.76", linewidth=0.8, zorder=0)
+    ax.set_xlabel("$x_k$")
+    ax.set_ylabel("$y_k$")
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=False)
+
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, bbox_inches="tight")
+
+    return fig, ax
+
+
+def sparse_labels(labels, step=1):
+    if labels is None:
+        return False
+    if step <= 1:
+        return labels
+    return [label if i % step == 0 else "" for i, label in enumerate(labels)]
+
+
+def choose_heatmap_cmap(matrix, cmap=None):
+    if cmap is not None:
+        return cmap
+    matrix = np.asarray(matrix, dtype=float)
+    if np.any(matrix < 0) and np.any(matrix > 0):
+        return "vlag"
+    return "Blues"
+
+
+def standardize_for_plot(x):
+    x = np.asarray(x, dtype=float)
+    return (x - np.mean(x)) / (np.std(x) + 1e-12)
+
+
+def format_value(value):
+    return f"{value:.3f}".rstrip("0").rstrip(".") if value != 0 else "0"
+
+
+def save_figure(fig, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def make_manual_sigma_matrix(a, b):
+    sigma_diag = np.diag([a, a, a])
+    sigma_cross = np.array(
+        [
+            [0.0, 0.0, b],
+            [0.0, 0.0, 0.0],
+            [b, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    sigma = sigma_diag + sigma_cross
+    return 0.5 * (sigma + sigma.T)
+
+
+def sample_gaussian_noise_from_sigma(n_samples, sigma, random_state=None):
+    sigma = np.asarray(sigma, dtype=float)
+    rng = np.random.default_rng(random_state)
+    return rng.multivariate_normal(
+        mean=np.zeros(sigma.shape[0]),
+        cov=sigma,
+        size=n_samples,
+        check_valid="warn",
+    )
+
+
+def plot_matrix_heatmap_to_file(
+    matrix,
+    title,
+    output_path,
+    row_labels=None,
+    col_labels=None,
+    center=0.0,
+    figsize=(6.2, 5.6),
+    label_step=1,
+    cmap=None,
+):
+    matrix_arr = np.asarray(matrix, dtype=float)
+    final_cmap = choose_heatmap_cmap(matrix_arr, cmap=cmap)
+    if center is None and final_cmap == "vlag":
+        center = 0.0
+    fig, ax = plt.subplots(figsize=figsize)
+    sns.heatmap(
+        matrix_arr,
+        ax=ax,
+        cmap=final_cmap,
+        center=center,
+        square=matrix_arr.shape[0] == matrix_arr.shape[1],
+        xticklabels=sparse_labels(col_labels, label_step),
+        yticklabels=sparse_labels(row_labels, label_step),
+    )
+    ax.set_title(title)
+    fig.tight_layout()
+    save_figure(fig, output_path)
+
+
+def plot_blue_singular_value_bars_to_file(values, title, output_path):
+    values = np.asarray(values, dtype=float).ravel()
+    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    ax.bar(np.arange(1, len(values) + 1), values, color="tab:blue", alpha=0.92, width=0.72, edgecolor="none")
+    ax.set_title(title)
+    ax.set_xlabel("Index")
+    ax.set_ylabel("Singular Value")
+    fig.tight_layout()
+    save_figure(fig, output_path)
+
+
+def plot_sorted_svd_spectrum_to_file(
+    forward_values,
+    backward_values,
+    title,
+    output_path,
+    forward_label="$\\Sigma^{-1}$",
+    backward_label="$A^T\\Sigma^{-1}A$",
+):
+    forward_values = np.asarray(forward_values, dtype=float).ravel()
+    backward_values = np.asarray(backward_values, dtype=float).ravel()
+    combined_data = [(value, "forward") for value in forward_values]
+    combined_data.extend((value, "backward") for value in backward_values)
+    combined_data.sort(key=lambda item: item[0], reverse=True)
+    sorted_values = [item[0] for item in combined_data]
+    sorted_labels = [item[1] for item in combined_data]
+    x = np.arange(1, len(sorted_values) + 1)
+
+    fig, ax = plt.subplots(figsize=(7.8, 4.8))
+    for i, value in enumerate(sorted_values):
+        color = "tab:blue" if sorted_labels[i] == "forward" else "tab:orange"
+        ax.bar(x[i], value, color=color, alpha=0.5, edgecolor="none")
+    ax.legend(
+        handles=[
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:blue", markersize=10, label=forward_label),
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:orange", markersize=10, label=backward_label),
+        ]
+    )
+    ax.set_title(title)
+    ax.set_xlabel("Index")
+    ax.set_ylabel("Value")
+    fig.tight_layout()
+    save_figure(fig, output_path)
+
+
+def plot_prediction_curves_to_file(series_names, predictions, targets, title, output_path, sample_count=80):
+    fig, ax = plt.subplots(figsize=(10.2, 5.0))
+    limit = min(sample_count, len(predictions))
+    x = np.arange(limit)
+    for idx, name in enumerate(series_names):
+        ax.plot(x, targets[:limit, idx], label=f"true {name}")
+        ax.plot(x, predictions[:limit, idx], "--", linewidth=1.8, label=f"pred {name}")
+    ax.set_title(title)
+    ax.set_xlabel("Pair Index")
+    ax.set_ylabel("Value")
+    ax.legend(ncol=max(1, min(3, len(series_names))))
+    fig.tight_layout()
+    save_figure(fig, output_path)
+
+
+def plot_micro_macro_curve_compare_to_file(micro_series, macro_series, macro_names, title, output_path, sample_count=120):
+    fig, ax = plt.subplots(figsize=(10.2, 5.0))
+    limit = min(sample_count, len(micro_series), len(macro_series))
+    x = np.arange(limit)
+    for idx, name in enumerate(FEATURE_NAMES):
+        ax.plot(x, standardize_for_plot(micro_series[:limit, idx]), linewidth=1.6, label=f"micro: {name}")
+    for idx, name in enumerate(macro_names):
+        ax.plot(x, standardize_for_plot(macro_series[:limit, idx]), "--", linewidth=2.3, label=f"macro: {name}")
+    ax.set_title(title)
+    ax.set_xlabel("Time Index")
+    ax.set_ylabel("Standardized Value")
+    ax.legend(ncol=2)
+    fig.tight_layout()
+    save_figure(fig, output_path)
+
+
+def build_w_from_two_stage(A, Sigma, metrics_eps=1e-10, manual_r=1, stage1_threshold=0.0):
+    metrics = compute_gis_metrics(A, Sigma, alpha=DEFAULT_CONFIG["alpha"], eps=metrics_eps)
+    sigma_inv = metrics["Sigma_inv"]
+    backward = metrics["A_t_Sigma_inv_A"]
+
+    u_det, s_det, _ = np.linalg.svd(sigma_inv, full_matrices=False)
+    u_nondeg, s_nondeg, _ = np.linalg.svd(backward, full_matrices=False)
+
+    combined_scores = np.concatenate([s_nondeg, s_det], axis=0)
+    combined_vectors = np.concatenate([u_nondeg, u_det], axis=1)
+    source_labels = np.array(["nondeg"] * len(s_nondeg) + ["det"] * len(s_det), dtype=object)
+    order = np.argsort(-combined_scores)
+    s_all = combined_scores[order]
+    u_all = combined_vectors[:, order]
+    source_all = source_labels[order]
+
+    keep_stage1 = s_all >= stage1_threshold
+    u_bar = u_all[:, keep_stage1]
+    s_bar = s_all[keep_stage1]
+    source_bar = source_all[keep_stage1]
+    weighted_matrix = u_bar @ np.diag(s_bar)
+
+    u2, s2, _ = np.linalg.svd(weighted_matrix, full_matrices=False)
+    r_final = max(1, min(int(manual_r), u2.shape[1]))
+    basis = u2[:, :r_final]
+
+    return {
+        "W": basis.T,
+        "r": r_final,
+        "sv_info": {
+            "sv_forward": metrics["sv_forward"],
+            "sv_backward": metrics["sv_backward"],
+            "sv_det": s_det,
+            "sv_nondeg": s_nondeg,
+            "sv_all": s_all,
+            "sv_stage2": s2,
+        },
+        "basis_info": {
+            "weighted_matrix": weighted_matrix,
+            "source_all": source_all.tolist(),
+            "source_bar": source_bar.tolist(),
+        },
+    }
+
+
+def plot_summary_ce_j_to_file(results_df, param_col, output_path):
+    fig, ax = plt.subplots(figsize=(8.8, 5.2))
+    x = results_df[param_col].to_numpy()
+    ax.plot(x, results_df["CE"], marker="o", linewidth=2.0, label="CE")
+    ax.plot(x, results_df["micro_J_alpha"], marker="s", linewidth=1.8, label="micro J_alpha")
+    ax.plot(x, results_df["macro_J_alpha"], marker="^", linewidth=1.8, label="macro J_alpha")
+    ax.set_title("CE and J_alpha")
+    ax.set_xlabel(param_col)
+    ax.set_ylabel("Value")
+    ax.legend()
+    fig.tight_layout()
+    save_figure(fig, output_path)
+
+
+def plot_summary_d_n_to_file(results_df, param_col, output_path):
+    fig, ax = plt.subplots(figsize=(8.8, 5.2))
+    x = results_df[param_col].to_numpy()
+    ax.plot(x, results_df["micro_D"], marker="o", linewidth=1.8, label="micro D")
+    ax.plot(x, results_df["micro_N"], marker="s", linewidth=1.8, label="micro N")
+    ax.plot(x, results_df["macro_D"], marker="^", linewidth=1.8, label="macro D")
+    ax.plot(x, results_df["macro_N"], marker="d", linewidth=1.8, label="macro N")
+    ax.set_title("D and N")
+    ax.set_xlabel(param_col)
+    ax.set_ylabel("Value")
+    ax.legend()
+    fig.tight_layout()
+    save_figure(fig, output_path)
+
+
+def plot_summary_prediction_errors_to_file(results_df, param_col, horizons, output_path):
+    fig, ax = plt.subplots(figsize=(9.2, 5.4))
+    x = results_df[param_col].to_numpy()
+    markers = {1: "o", 3: "s", 5: "^"}
+    for horizon in horizons:
+        ax.plot(x, results_df[f"micro_E{horizon}"], marker=markers.get(horizon, "o"), linewidth=1.8, label=f"micro E{horizon}")
+        ax.plot(
+            x,
+            results_df[f"macro_E{horizon}"],
+            marker=markers.get(horizon, "o"),
+            linewidth=1.8,
+            linestyle="--",
+            label=f"macro E{horizon}",
+        )
+    ax.set_title("Prediction Errors")
+    ax.set_xlabel(param_col)
+    ax.set_ylabel("Mean Squared Error")
+    ax.legend(ncol=2)
+    fig.tight_layout()
+    save_figure(fig, output_path)
+
+
+def plot_3d_bars_series(results_df, x_col, value_cols, y_labels, title, x_label, y_label, z_label, output_path):
+    fig = plt.figure(figsize=(10.8, 7.2))
+    ax = fig.add_subplot(111, projection="3d")
+    x_values = results_df[x_col].to_numpy()
+    norm = Normalize(vmin=0, vmax=max(1, len(y_labels) - 1))
+    cmap = cm.Blues
+
+    for yi, col in enumerate(value_cols):
+        xs = x_values
+        ys = np.full_like(xs, yi, dtype=float)
+        zs = np.zeros_like(xs, dtype=float)
+        dx = np.full_like(xs, max(0.03, (xs.max() - xs.min()) / max(20, len(xs) * 4)), dtype=float)
+        dy = np.full_like(xs, 0.6, dtype=float)
+        dz = results_df[col].to_numpy()
+        color = cmap(0.35 + 0.5 * norm(yi))
+        ax.bar3d(xs - dx / 2, ys - dy / 2, zs, dx, dy, dz, color=color, edgecolor="none", shade=True, alpha=0.95)
+
+    ax.set_title(title, pad=18)
+    ax.set_xlabel(x_label, labelpad=12)
+    ax.set_ylabel(y_label, labelpad=12)
+    ax.set_zlabel(z_label, labelpad=12)
+    ax.set_yticks(np.arange(len(y_labels)))
+    ax.set_yticklabels(y_labels)
+    ax.view_init(elev=24, azim=-128)
+    save_figure(fig, output_path)
+
+
+def plot_3d_ab_panels(results_df, value_cols, titles, x_col, y_col, z_label, super_title, output_path, ncols=3):
+    n_panels = len(value_cols)
+    ncols = min(ncols, n_panels)
+    nrows = int(np.ceil(n_panels / ncols))
+    fig = plt.figure(figsize=(5.2 * ncols, 4.6 * nrows))
+    norm = Normalize(vmin=results_df[value_cols].to_numpy().min(), vmax=results_df[value_cols].to_numpy().max())
+    cmap = cm.Blues
+
+    for idx, (col, panel_title) in enumerate(zip(value_cols, titles), start=1):
+        ax = fig.add_subplot(nrows, ncols, idx, projection="3d")
+        xs = results_df[x_col].to_numpy()
+        ys = results_df[y_col].to_numpy()
+        dz = results_df[col].to_numpy()
+        dx = np.full_like(xs, 0.18, dtype=float)
+        dy = np.full_like(xs, 0.08, dtype=float)
+        colors = cmap(0.25 + 0.65 * norm(dz))
+        ax.bar3d(xs - dx / 2, ys - dy / 2, np.zeros_like(dz), dx, dy, dz, color=colors, edgecolor="none", shade=True, alpha=0.96)
+        ax.set_title(panel_title, pad=10)
+        ax.set_xlabel("a", labelpad=6)
+        ax.set_ylabel("b", labelpad=6)
+        ax.set_zlabel(z_label, labelpad=6)
+        ax.view_init(elev=24, azim=-130)
+
+    fig.suptitle(super_title, y=0.99)
+    fig.tight_layout()
+    save_figure(fig, output_path)
+
+
+def plot_heatmap_from_grid(results_df, value_col, title, output_path, x_col="a", y_col="b", cmap="Blues"):
+    pivot = results_df.pivot(index=y_col, columns=x_col, values=value_col).sort_index().sort_index(axis=1)
+    fig, ax = plt.subplots(figsize=(8.4, 6.2))
+    sns.heatmap(pivot, ax=ax, cmap=cmap, mask=pivot.isna(), cbar=True)
+    ax.set_title(title)
+    ax.set_xlabel(x_col)
+    ax.set_ylabel(y_col)
+    fig.tight_layout()
+    save_figure(fig, output_path)
+
+
+def dataframe_to_markdown(df):
+    headers = list(df.columns)
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    for _, row in df.iterrows():
+        values = []
+        for value in row:
+            if isinstance(value, (float, np.floating)):
+                values.append(f"{float(value):.6f}")
+            else:
+                values.append(str(value))
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines)
+
+
+def run_single_experiment(a, b, label, figs_root, config):
+    single_dir = Path(figs_root) / label
+    single_dir.mkdir(parents=True, exist_ok=True)
+
+    clean_sim = simulate_discrete_system(
+        step_map,
+        config["initial_state"],
+        steps=config["steps"],
+        system_kwargs={"lam": config["lam"], "mu": config["mu"]},
+        dt=config["dt"],
+    )
+    clean_xy = clean_sim["trajectories"][0]
+    obs_clean = observable_step(clean_xy, mode="default")
+
+    sigma_micro = make_manual_sigma_matrix(a, b)
+    obs_noise = sample_gaussian_noise_from_sigma(len(obs_clean), sigma_micro, random_state=config["noise_seed"])
+    obs_noisy = obs_clean + obs_noise
+
+    a_micro = make_step_system_matrix(config["lam"], config["mu"])
+    micro_metrics = compute_gis_metrics(a_micro, sigma_micro, alpha=config["alpha"], eps=config["metrics_eps"])
+    micro_errors = compute_prediction_errors(a_micro, obs_noisy, tau=config["tau"], horizons=config["horizons"])
+
+    w_result = build_w_from_two_stage(a_micro, sigma_micro, metrics_eps=config["metrics_eps"], manual_r=config["manual_r"], stage1_threshold=0.0)
+    w_matrix = w_result["W"]
+    macro_names = [f"$z_{i+1}$" for i in range(w_result["r"])]
+    z_series = apply_coarse_graining(w_matrix, obs_noisy)
+
+    a_macro = w_matrix @ a_micro @ w_matrix.T
+    sigma_macro = w_matrix @ sigma_micro @ w_matrix.T
+    macro_metrics = compute_gis_metrics(a_macro, sigma_macro, alpha=config["alpha"], eps=config["metrics_eps"])
+    macro_errors = compute_prediction_errors(a_macro, z_series, tau=config["tau"], horizons=config["horizons"])
+    ce_result = compute_ce_from_micro_macro(micro_metrics, macro_metrics)
+
+    plot_matrix_heatmap_to_file(sigma_micro, f"Micro Sigma, {label}", single_dir / f"micro_sigma_{label}.png", row_labels=FEATURE_NAMES, col_labels=FEATURE_NAMES, center=0.0)
+    plot_prediction_curves_to_file(FEATURE_NAMES, micro_errors[1]["predictions"], micro_errors[1]["targets"], f"Micro Prediction, {label}", single_dir / f"micro_prediction_{label}.png")
+    plot_sorted_svd_spectrum_to_file(micro_metrics["sv_forward"], micro_metrics["sv_backward"], f"Sorted SVD Spectrum, {label}", single_dir / f"sorted_svd_spectrum_{label}.png")
+    plot_matrix_heatmap_to_file(
+        w_result["basis_info"]["weighted_matrix"],
+        f"Stage-2 Matrix, {label}",
+        single_dir / f"stage2_matrix_{label}.png",
+        row_labels=FEATURE_NAMES,
+        col_labels=[f"$c_{i+1}$" for i in range(w_result["basis_info"]["weighted_matrix"].shape[1])],
+        center=0.0,
+        figsize=(6.2, 4.8),
+        cmap="vlag",
+    )
+    plot_blue_singular_value_bars_to_file(w_result["sv_info"]["sv_stage2"], f"Stage-2 Singular Values, {label}", single_dir / f"stage2_spectrum_{label}.png")
+    plot_matrix_heatmap_to_file(np.abs(w_matrix), f"Absolute W, {label}", single_dir / f"W_heatmap_{label}.png", row_labels=macro_names, col_labels=FEATURE_NAMES, center=None, figsize=(5.4, 3.4), cmap="Blues")
+    plot_prediction_curves_to_file(macro_names, macro_errors[1]["predictions"], macro_errors[1]["targets"], f"Macro Prediction, {label}", single_dir / f"macro_prediction_{label}.png")
+    plot_micro_macro_curve_compare_to_file(obs_noisy, z_series, macro_names, f"Micro and Macro Curves, {label}", single_dir / f"micro_macro_curve_{label}.png")
+
+    stage2_sv = np.asarray(w_result["sv_info"]["sv_stage2"], dtype=float)
+    w_abs = np.abs(np.asarray(w_matrix, dtype=float).ravel())
+
+    row = {
+        "label": label,
+        "a": float(a),
+        "b": float(b),
+        "micro_dim": micro_metrics["dimension"],
+        "macro_dim": macro_metrics["dimension"],
+        "selected_r": w_result["r"],
+        "CE": ce_result["CE"],
+        "micro_J_alpha": micro_metrics["J_alpha"],
+        "macro_J_alpha": macro_metrics["J_alpha"],
+        "micro_D": micro_metrics["D"],
+        "micro_N": micro_metrics["N"],
+        "macro_D": macro_metrics["D"],
+        "macro_N": macro_metrics["N"],
+        "stage2_sv1": float(stage2_sv[0]) if len(stage2_sv) > 0 else np.nan,
+        "stage2_sv2": float(stage2_sv[1]) if len(stage2_sv) > 1 else np.nan,
+        "stage2_sv3": float(stage2_sv[2]) if len(stage2_sv) > 2 else np.nan,
+        "W_abs_x": float(w_abs[0]) if len(w_abs) > 0 else np.nan,
+        "W_abs_y": float(w_abs[1]) if len(w_abs) > 1 else np.nan,
+        "W_abs_x2": float(w_abs[2]) if len(w_abs) > 2 else np.nan,
+    }
+    for horizon in config["horizons"]:
+        row[f"micro_E{horizon}"] = micro_errors[horizon]["mean_error"]
+        row[f"macro_E{horizon}"] = macro_errors[horizon]["mean_error"]
+
+    detail = {
+        "label": label,
+        "micro_metrics": micro_metrics,
+        "macro_metrics": macro_metrics,
+        "micro_errors": micro_errors,
+        "macro_errors": macro_errors,
+        "ce_result": ce_result,
+        "stage2_sv": stage2_sv,
+        "w_abs": w_abs,
+    }
+    return row, detail
+
+
+def detail_by_label(details):
+    return {detail["label"]: detail for detail in details}
+
+
+def render_detail_block(root_name, label, detail):
+    return "\n".join(
+        [
+            f"#### {label}",
+            "",
+            f"![Micro Sigma](./figs/{root_name}/{label}/micro_sigma_{label}.png)",
+            "",
+            f"![Micro Prediction](./figs/{root_name}/{label}/micro_prediction_{label}.png)",
+            "",
+            f"![Sorted SVD Spectrum](./figs/{root_name}/{label}/sorted_svd_spectrum_{label}.png)",
+            "",
+            f"![Stage2 Matrix](./figs/{root_name}/{label}/stage2_matrix_{label}.png)",
+            "",
+            f"![Stage2 Singular Values](./figs/{root_name}/{label}/stage2_spectrum_{label}.png)",
+            "",
+            f"![Absolute W](./figs/{root_name}/{label}/W_heatmap_{label}.png)",
+            "",
+            f"![Macro Prediction](./figs/{root_name}/{label}/macro_prediction_{label}.png)",
+            "",
+            f"![Micro Macro Curves](./figs/{root_name}/{label}/micro_macro_curve_{label}.png)",
+            "",
+            f"- Stage-2 singular values: `{np.array2string(detail['stage2_sv'], precision=6, separator=', ')}`",
+            f"- Absolute W: `{np.array2string(detail['w_abs'], precision=6, separator=', ')}`",
+            "",
+        ]
+    )
+
+
+def select_best_b_row(results_df):
+    df = results_df.copy()
+    df["sv_ratio"] = df["stage2_sv1"] / np.maximum(df["stage2_sv2"], 1e-12)
+    mask = (df["W_abs_y"] > df["W_abs_x"]) & (df["W_abs_y"] > df["W_abs_x2"])
+    candidate_df = df[mask].copy()
+    if candidate_df.empty:
+        candidate_df = df
+    candidate_df["score"] = candidate_df["sv_ratio"] + 0.5 * candidate_df["CE"]
+    best_idx = candidate_df["score"].idxmax()
+    return candidate_df.loc[best_idx]
+
+
+def build_section_markdown_a(results_df, details):
+    detail_map = detail_by_label(details)
+    summary_df = results_df[results_df["a"].isin(A_SUMMARY_VALUES)].copy()
+    extra_labels = [label for label in results_df["label"].tolist() if label not in set(summary_df["label"])]
+    lines = [
+        "## 实验一：固定 b=0，扫描 a",
+        "",
+        "固定 `b = 0`，扫描 `a`。汇总图仅展示 `a ∈ [0.2, 1.0]` 的结果，`a=0`、极小噪声和大噪声点保留为单次实验图。",
+        "",
+        "### 汇总图",
+        "",
+        "![CE and J_alpha](./figs/a/all/summary_ce_j_alpha.png)",
+        "",
+        "![D and N](./figs/a/all/summary_d_n.png)",
+        "",
+        "![Prediction Errors](./figs/a/all/summary_prediction_errors.png)",
+        "",
+        "![Stage2 Singular Values](./figs/a/all/summary_stage2_singular_values.png)",
+        "",
+        "![Absolute W](./figs/a/all/summary_w_abs.png)",
+        "",
+        "### 数值汇总",
+        "",
+        dataframe_to_markdown(summary_df),
+        "",
+        "### 说明",
+        "",
+        "- 当 `b=0` 且 `a>0` 时，`Sigma = aI`，其逆就是 `Sigma^{-1} = (1/a)I`。",
+        "- 当 `a=0, b=0` 时，`Sigma` 退化为零矩阵；当前代码在 `compute_gis_metrics` 中会加上极小正则项并使用正则化伪逆，因此会出现非常大的奇异值。这也是本次把 `a=0` 从汇总图中移除的原因。",
+        "",
+        "### 单独结论",
+        "",
+        "- 在 `b=0` 的条件下，`CE` 在汇总区间内基本保持稳定，说明纯对角噪声主要改变整体尺度，而没有明显改变宏观层相对微观层的单位维度优势。",
+        "- `micro_J_alpha` 与 `macro_J_alpha` 会随着 `a` 增大而整体下降，说明噪声增强会同时压低宏观和微观的可逆性，但二者的差值变化很小。",
+        "- Stage-2 奇异值随着 `a` 增大快速衰减，说明两阶段结构的谱强度主要受对角噪声幅值控制。",
+        "",
+        "### 单次实验图（不在汇总图中展示的点）",
+        "",
+    ]
+    for label in extra_labels:
+        lines.append(render_detail_block("a", label, detail_map[label]))
+    return "\n".join(lines)
+
+
+def build_section_markdown_b(results_df, details):
+    best_row = select_best_b_row(results_df)
+    lines = [
+        "## 实验二：固定 a=1，扫描 b",
+        "",
+        "固定 `a = 1`，扫描 `b`。由于全部 `b` 值都进入汇总图，因此本节不再重复展示单次图。",
+        "",
+        "### 汇总图",
+        "",
+        "![CE and J_alpha](./figs/b/all/summary_ce_j_alpha.png)",
+        "",
+        "![D and N](./figs/b/all/summary_d_n.png)",
+        "",
+        "![Prediction Errors](./figs/b/all/summary_prediction_errors.png)",
+        "",
+        "![Stage2 Singular Values](./figs/b/all/summary_stage2_singular_values.png)",
+        "",
+        "![Absolute W](./figs/b/all/summary_w_abs.png)",
+        "",
+        "### 数值汇总",
+        "",
+        dataframe_to_markdown(results_df),
+        "",
+        "### 单独结论",
+        "",
+        "- 随着 `b` 增大，`CE` 整体下降，说明交叉噪声会持续侵蚀宏观优势。",
+        "- `macro_J_alpha` 对 `b` 的变化更敏感，表明交叉项首先破坏的是宏观压缩后的有效组织效率。",
+        f"- 按“`sv1` 显著大于其余奇异值且 `|W_y|` 最大”这一标准，本轮最优点出现在 `b={best_row['b']:.2f}`，对应 `sv = ({best_row['stage2_sv1']:.6f}, {best_row['stage2_sv2']:.6f}, {best_row['stage2_sv3']:.6f})`，`|W| = ({best_row['W_abs_x']:.6f}, {best_row['W_abs_y']:.6f}, {best_row['W_abs_x2']:.6f})`，`CE = {best_row['CE']:.6f}`。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def build_section_markdown_c(results_df):
+    lines = [
+        "## 实验三：更规整的联合扫描网格 c",
+        "",
+        "使用更规则的 `(a, b)` 网格，并保持 `a > b`。本节只展示热力图，不重复展示已纳入汇总的单次实验图。",
+        "",
+        "### 汇总图",
+        "",
+        "![CE Heatmap](./figs/c/all/summary_ce_j_alpha.png)",
+        "",
+        "![Micro J_alpha Heatmap](./figs/c/all/summary_d_n.png)",
+        "",
+        "![Macro J_alpha Heatmap](./figs/c/all/summary_prediction_errors.png)",
+        "",
+        "### 数值汇总",
+        "",
+        dataframe_to_markdown(results_df[["label", "a", "b", "CE", "micro_J_alpha", "macro_J_alpha"]]),
+        "",
+        "### 单独结论",
+        "",
+        "- 在规则网格上，`CE` 的高值区集中在小 `a`、小 `b` 的角落。",
+        "- `micro_J_alpha` 和 `macro_J_alpha` 都会随着 `a`、`b` 的增大而整体下降，但 `macro_J_alpha` 对交叉项 `b` 更敏感。",
+        "- 这说明在联合噪声下，交叉耦合是压低宏观收益的关键因素，而纯尺度放大主要由 `a` 控制。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def build_report(a_df, a_details, b_df, b_details, c_df):
+    return "\n".join(
+        [
+            "# 第三部分噪音批量实验",
+            "",
+            build_section_markdown_a(a_df, a_details),
+            "",
+            build_section_markdown_b(b_df, b_details),
+            "",
+            build_section_markdown_c(c_df),
+            "",
+        ]
+    )
+
+
+def run_scan_a(figs_root, config):
+    root = Path(figs_root) / "a"
+    summary_dir = root / "all"
+    rows, details = [], []
+    for a in A_SCAN_VALUES:
+        label = format_value(a)
+        row, detail = run_single_experiment(a, 0.0, label, root, config)
+        rows.append(row)
+        details.append(detail)
+    df = pd.DataFrame(rows).sort_values("a").reset_index(drop=True)
+    summary_df = df[df["a"].isin(A_SUMMARY_VALUES)].copy()
+    plot_summary_ce_j_to_file(summary_df, "a", summary_dir / "summary_ce_j_alpha.png")
+    plot_summary_d_n_to_file(summary_df, "a", summary_dir / "summary_d_n.png")
+    plot_summary_prediction_errors_to_file(summary_df, "a", config["horizons"], summary_dir / "summary_prediction_errors.png")
+    plot_3d_bars_series(summary_df, "a", ["stage2_sv3", "stage2_sv2", "stage2_sv1"], ["sv3", "sv2", "sv1"], "Stage-2 Singular Values vs a", "a", "Singular Index", "Singular Value", summary_dir / "summary_stage2_singular_values.png")
+    plot_3d_bars_series(summary_df, "a", ["W_abs_x", "W_abs_y", "W_abs_x2"], ["|W_x|", "|W_y|", "|W_x2|"], "Absolute W vs a", "a", "Component", "Absolute Value", summary_dir / "summary_w_abs.png")
+    return df, details
+
+
+def run_scan_b(figs_root, config):
+    root = Path(figs_root) / "b"
+    summary_dir = root / "all"
+    rows, details = [], []
+    for b in B_SCAN_VALUES:
+        label = format_value(b)
+        row, detail = run_single_experiment(1.0, b, label, root, config)
+        rows.append(row)
+        details.append(detail)
+    df = pd.DataFrame(rows).sort_values("b").reset_index(drop=True)
+    plot_summary_ce_j_to_file(df, "b", summary_dir / "summary_ce_j_alpha.png")
+    plot_summary_d_n_to_file(df, "b", summary_dir / "summary_d_n.png")
+    plot_summary_prediction_errors_to_file(df, "b", config["horizons"], summary_dir / "summary_prediction_errors.png")
+    plot_3d_bars_series(df, "b", ["stage2_sv3", "stage2_sv2", "stage2_sv1"], ["sv3", "sv2", "sv1"], "Stage-2 Singular Values vs b", "b", "Singular Index", "Singular Value", summary_dir / "summary_stage2_singular_values.png")
+    plot_3d_bars_series(df, "b", ["W_abs_x", "W_abs_y", "W_abs_x2"], ["|W_x|", "|W_y|", "|W_x2|"], "Absolute W vs b", "b", "Component", "Absolute Value", summary_dir / "summary_w_abs.png")
+    return df, details
+
+
+def run_scan_ab(figs_root, config):
+    root = Path(figs_root) / "ab"
+    summary_dir = root / "all"
+    rows, details = [], []
+    for a, b in AB_SCAN_VALUES:
+        label = f"a_{format_value(a)}_b_{format_value(b)}"
+        row, detail = run_single_experiment(a, b, label, root, config)
+        rows.append(row)
+        details.append(detail)
+    df = pd.DataFrame(rows).sort_values(["a", "b"]).reset_index(drop=True)
+    plot_3d_ab_panels(df, ["CE", "micro_J_alpha", "macro_J_alpha"], ["CE", "micro J_alpha", "macro J_alpha"], "a", "b", "Value", "CE and J_alpha on (a, b)", summary_dir / "summary_ce_j_alpha.png", ncols=3)
+    plot_3d_ab_panels(df, ["micro_D", "micro_N", "macro_D", "macro_N"], ["micro D", "micro N", "macro D", "macro N"], "a", "b", "Value", "D and N on (a, b)", summary_dir / "summary_d_n.png", ncols=2)
+    plot_3d_ab_panels(df, ["micro_E1", "macro_E1", "micro_E3", "macro_E3", "micro_E5", "macro_E5"], ["micro E1", "macro E1", "micro E3", "macro E3", "micro E5", "macro E5"], "a", "b", "Mean Squared Error", "Prediction Errors on (a, b)", summary_dir / "summary_prediction_errors.png", ncols=3)
+    plot_3d_ab_panels(df, ["stage2_sv1", "stage2_sv2", "stage2_sv3"], ["sv1", "sv2", "sv3"], "a", "b", "Singular Value", "Stage-2 Singular Values on (a, b)", summary_dir / "summary_stage2_singular_values.png")
+    plot_3d_ab_panels(df, ["W_abs_x", "W_abs_y", "W_abs_x2"], ["|W_x|", "|W_y|", "|W_x2|"], "a", "b", "Absolute Value", "Absolute W on (a, b)", summary_dir / "summary_w_abs.png")
+    return df, details
+
+
+def run_scan_c(figs_root, config):
+    root = Path(figs_root) / "c"
+    summary_dir = root / "all"
+    rows, details = [], []
+    for a in C_A_VALUES:
+        for b in C_B_VALUES:
+            if not (a > b):
+                continue
+            label = f"a_{format_value(a)}_b_{format_value(b)}"
+            row, detail = run_single_experiment(a, b, label, root, config)
+            rows.append(row)
+            details.append(detail)
+    df = pd.DataFrame(rows).sort_values(["a", "b"]).reset_index(drop=True)
+    plot_heatmap_from_grid(df, "CE", "CE Heatmap", summary_dir / "summary_ce_j_alpha.png", cmap="vlag")
+    plot_heatmap_from_grid(df, "micro_J_alpha", "Micro J_alpha Heatmap", summary_dir / "summary_d_n.png", cmap="vlag")
+    plot_heatmap_from_grid(df, "macro_J_alpha", "Macro J_alpha Heatmap", summary_dir / "summary_prediction_errors.png", cmap="vlag")
+    return df, details
