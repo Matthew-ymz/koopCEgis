@@ -42,14 +42,52 @@ class ParameterCombo:
     process_noise: float
 
 
-DEFAULT_COMBOS = [
-    ParameterCombo("C1", 0.10, 0.90, 0.50, 0.00, 0.0015),
-    ParameterCombo("C2", 0.25, 0.75, 0.50, 0.06, 0.0015),
-    ParameterCombo("C3", 0.45, 0.55, 0.55, 0.12, 0.0020),
-    ParameterCombo("C4", 0.65, 0.35, 0.70, 0.18, 0.0025),
-    ParameterCombo("C5", 0.82, 0.18, 1.00, 0.28, 0.0030),
-    ParameterCombo("C6", 0.95, 0.60, 1.50, 0.42, 0.0035),
-]
+@dataclass(frozen=True)
+class ExperimentGroup:
+    key: str
+    description: str
+    combos: tuple[ParameterCombo, ...]
+
+
+def make_experiment_groups(noise_process_max: float = 0.05) -> tuple[ExperimentGroup, ExperimentGroup]:
+    weak_noise_a = 0.02
+    weak_noise_b = 0.0
+    weak_process_noise = 0.0002
+    if noise_process_max <= weak_process_noise:
+        raise ValueError(f"noise_process_max must be greater than {weak_process_noise}")
+    deterministic_scan = ExperimentGroup(
+        key="deterministic",
+        description="fixed weak noise; deterministic parameters vary",
+        combos=(
+            ParameterCombo("D1", 0.10, 0.90, weak_noise_a, weak_noise_b, weak_process_noise),
+            ParameterCombo("D2", 0.25, 0.88, weak_noise_a, weak_noise_b, weak_process_noise),
+            ParameterCombo("D3", 0.45, 0.84, weak_noise_a, weak_noise_b, weak_process_noise),
+            ParameterCombo("D4", 0.65, 0.82, weak_noise_a, weak_noise_b, weak_process_noise),
+            ParameterCombo("D5", 0.82, 0.80, weak_noise_a, weak_noise_b, weak_process_noise),
+            ParameterCombo("D6", 0.95, 0.78, weak_noise_a, weak_noise_b, weak_process_noise),
+        ),
+    )
+
+    fixed_lam = 0.10
+    fixed_mu = 0.90
+    noise_levels = (0.02, 0.05, 0.10, 0.20, 0.50, 1.00)
+    process_noises = tuple(np.geomspace(weak_process_noise, noise_process_max, len(noise_levels)))
+    noise_scan = ExperimentGroup(
+        key="noise",
+        description="fixed fast-slow dynamics; noise strength varies",
+        combos=tuple(
+            ParameterCombo(
+                f"N{idx}",
+                fixed_lam,
+                fixed_mu,
+                level,
+                0.20 * level,
+                process_noise,
+            )
+            for idx, (level, process_noise) in enumerate(zip(noise_levels, process_noises), start=1)
+        ),
+    )
+    return deterministic_scan, noise_scan
 
 
 def configure_style() -> None:
@@ -305,9 +343,16 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=20260505)
     parser.add_argument("--eps", type=float, default=1e-10)
     parser.add_argument(
+        "--noise-process-max",
+        type=float,
+        default=0.05,
+        help="Maximum process noise used by the fixed-dynamics noise scan.",
+    )
+    parser.add_argument(
         "--output-base",
         type=Path,
         default=Path("exp/analysitic/figs/backward_svd_parameter_grid"),
+        help="Base path. Group keys are appended before the file extension.",
     )
     parser.add_argument("--formats", nargs="+", default=["svg", "pdf", "png", "tiff"])
     return parser.parse_args()
@@ -320,20 +365,33 @@ def main():
         x_values=(-1.10, 0.0, 1.10),
         y_values=(-0.60, 0.0, 0.60),
     )
-    results = [
-        analyze_combo(combo, initial_states=initial_states, steps=args.steps, seed=args.seed + idx, eps=args.eps)
-        for idx, combo in enumerate(DEFAULT_COMBOS)
-    ]
-    saved = plot_parameter_grid(results, output_base=args.output_base, formats=args.formats)
-
-    summary_path = args.output_base.with_name(args.output_base.name + "_summary.csv")
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(summary_rows(results)).to_csv(summary_path, index=False)
-
     print("Saved figure files:")
-    for ext, path in saved.items():
-        print(f"  {ext}: {path}")
-    print(f"Saved source summary: {summary_path}")
+    for group_index, group in enumerate(make_experiment_groups(noise_process_max=args.noise_process_max)):
+        results = [
+            analyze_combo(
+                combo,
+                initial_states=initial_states,
+                steps=args.steps,
+                seed=args.seed + 100 * group_index + idx,
+                eps=args.eps,
+            )
+            for idx, combo in enumerate(group.combos)
+        ]
+        output_base = args.output_base.with_name(f"{args.output_base.name}_{group.key}")
+        saved = plot_parameter_grid(results, output_base=output_base, formats=args.formats)
+
+        summary_path = output_base.with_name(output_base.name + "_summary.csv")
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        rows = summary_rows(results)
+        for row in rows:
+            row["group"] = group.key
+            row["group_description"] = group.description
+        pd.DataFrame(rows).to_csv(summary_path, index=False)
+
+        print(f"  {group.key}: {group.description}")
+        for ext, path in saved.items():
+            print(f"    {ext}: {path}")
+        print(f"    summary: {summary_path}")
 
 
 if __name__ == "__main__":

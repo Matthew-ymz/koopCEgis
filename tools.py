@@ -1,10 +1,7 @@
-import pysindy as ps
 from pathlib import Path
-from sklearn.metrics import mean_squared_error
 from tqdm import tqdm
 import math
 from typing import Iterable, Sequence, Union
-from sklearn.preprocessing import MaxAbsScaler, StandardScaler
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
@@ -14,11 +11,9 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from scipy.integrate import odeint
 import seaborn as sns
 from numpy.polynomial.legendre import Legendre
 from scipy.special import legendre # legendre(n)用于生成n阶勒让德多项式。
-from scipy.integrate import fixed_quad 
 from scipy.linalg import eig
 from scipy.linalg import eigh
 from scipy.sparse.linalg import eigsh
@@ -555,6 +550,9 @@ def fit_sindy_sr3_robust(X, lib, feature_names,
             'model': model
         }
     """
+    import pysindy as ps
+    from sklearn.metrics import mean_squared_error
+
     # === 第一步：检查并转换输入 ===
     if isinstance(X, list):
         # 如果是列表，验证一致性
