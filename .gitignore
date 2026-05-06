@@ -354,3 +354,7 @@ $RECYCLE.BIN/
 *.npy
 *.pkl
 *.pdf
+
+# Large generated experiment figure exports
+exp/analysitic/figs/*.tiff
+exp/analysitic/figs/*.tif
