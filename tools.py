@@ -1,4 +1,3 @@
-import pysindy as ps
 from sklearn.metrics import mean_squared_error
 from tqdm import tqdm
 import math
@@ -8,10 +7,13 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+except ModuleNotFoundError:
+    px = None
+    go = None
 from scipy.integrate import odeint
-import seaborn as sns
 from numpy.polynomial.legendre import Legendre
 from scipy.special import legendre # legendre(n)用于生成n阶勒让德多项式。
 from scipy.integrate import fixed_quad 
@@ -551,6 +553,8 @@ def fit_sindy_sr3_robust(X, lib, feature_names,
             'model': model
         }
     """
+    import pysindy as ps
+
     # === 第一步：检查并转换输入 ===
     if isinstance(X, list):
         # 如果是列表，验证一致性
@@ -882,6 +886,9 @@ def fit_sindy_sr3_robust(
 '''
 
 def plot_station(df, coarse_grain_coff, delay=0):
+    if px is None:
+        raise ImportError("plot_station 需要安装 plotly，请先安装 plotly 后再调用该函数。")
+
     if isinstance(coarse_grain_coff, np.ndarray):
         coff_df = pd.DataFrame(coarse_grain_coff)
     else:
@@ -3303,6 +3310,289 @@ def compute_gis_metrics(A, Sigma, alpha=1.0, eps=1e-10):
     }
 
 
+def make_analytic_sigma_matrix(b, c):
+    """
+    构造解析实验专用的结构化噪声协方差矩阵。
+
+    本函数对应研究流程中的解析噪声设定：
+
+        [[b, 0, c],
+         [0, b, 0],
+         [c, 0, b]]
+
+    该矩阵常用于已知动力学的解析验证实验，其中 b 控制对角噪声，
+    c 控制第 1 与第 3 个观测通道之间的相关噪声。
+
+    Parameters
+    ----------
+    b : float
+        对角噪声强度。
+    c : float
+        相关噪声强度。
+
+    Returns
+    -------
+    np.ndarray of shape (3, 3)
+        解析实验中的协方差矩阵。
+    """
+    b = float(b)
+    c = float(c)
+    return np.array(
+        [
+            [b, 0.0, c],
+            [0.0, b, 0.0],
+            [c, 0.0, b],
+        ],
+        dtype=float,
+    )
+
+
+def check_analytic_sigma_validity(b, c, allow_singular=True, atol=1e-12):
+    """
+    检查解析实验协方差参数 (b, c) 的合法性。
+
+    对于矩阵
+
+        [[b, 0, c],
+         [0, b, 0],
+         [c, 0, b]]
+
+    当其半正定时，需要满足 b >= |c| 且 b >= 0。
+    若进一步限定 c >= 0，则可写成 b >= c >= 0。
+
+    Parameters
+    ----------
+    b : float
+        对角噪声强度。
+    c : float
+        相关噪声强度。
+    allow_singular : bool, default=True
+        是否允许奇异协方差矩阵。若为 False，则要求严格正定，
+        即 b > |c| 且 b > 0。
+    atol : float, default=1e-12
+        数值比较时使用的容差。
+
+    Returns
+    -------
+    dict
+        {
+            "is_valid": bool,
+            "is_positive_semidefinite": bool,
+            "is_positive_definite": bool,
+            "message": str,
+            "eigenvalues": np.ndarray,
+        }
+    """
+    sigma = make_analytic_sigma_matrix(b, c)
+    eigvals = np.linalg.eigvalsh(sigma)
+    is_psd = bool(np.all(eigvals >= -atol))
+    is_pd = bool(np.all(eigvals > atol))
+
+    if allow_singular:
+        is_valid = is_psd
+        if is_valid:
+            message = "参数合法：协方差矩阵为半正定。"
+        else:
+            message = "参数不合法：协方差矩阵不是半正定，通常需要满足 b >= |c| 且 b >= 0。"
+    else:
+        is_valid = is_pd
+        if is_valid:
+            message = "参数合法：协方差矩阵为正定。"
+        else:
+            message = "参数不合法：协方差矩阵不是正定，通常需要满足 b > |c| 且 b > 0。"
+
+    return {
+        "is_valid": is_valid,
+        "is_positive_semidefinite": is_psd,
+        "is_positive_definite": is_pd,
+        "message": message,
+        "eigenvalues": np.real_if_close(eigvals),
+    }
+
+
+def compute_ce_from_spectral_terms(
+    s_vals,
+    kappa_vals,
+    r_eps=None,
+    alpha=1.0,
+    eps=1e-10,
+    dimension=None,
+):
+    """
+    按研究流程 2.0 的谱公式直接计算 CE。
+
+    这里使用两组谱量：
+    - s_i : A^T Sigma^{-1} A 的非零谱（或奇异值谱）
+    - kappa_i : Sigma^{-1} 的非零谱（或奇异值谱）
+
+    先计算微观层单位维度平均量
+
+        gamma_hat =
+            (1 / n) * [ (1/2 - alpha/4) * sum(log s_i)
+                      + (alpha/4) * sum(log kappa_i) ]
+
+    再计算截断到 r_eps 个主方向后的单位维度平均量
+
+        gamma_hat(eps) =
+            (1 / r_eps) * [ (1/2 - alpha/4) * sum_{i<=r_eps}(log s_i)
+                          + (alpha/4) * sum_{i<=r_eps}(log kappa_i) ]
+
+    最终
+
+        CE = gamma_hat(eps) - gamma_hat
+
+    Parameters
+    ----------
+    s_vals : array-like
+        对应 A^T Sigma^{-1} A 的谱值，默认按降序使用。
+    kappa_vals : array-like
+        对应 Sigma^{-1} 的谱值，默认按降序使用。
+    r_eps : int or None, default=None
+        截断维度。若为 None，则在 1..min(r_s, r_kappa) 中
+        自动选择使 CE 最大的 r。
+    alpha : float, default=1.0
+        研究流程中的 alpha 参数。
+    eps : float, default=1e-10
+        判定有效谱值与避免 log(0) 的阈值。
+    dimension : int or None, default=None
+        微观层原始维度 n。若为 None，则默认使用 max(r_s, r_kappa)。
+        若已知原始系统维度，建议显式传入，以严格对应研究流程中的公式。
+
+    Returns
+    -------
+    dict
+        {
+            "CE": float,
+            "gamma_hat": float,
+            "gamma_hat_eps": float,
+            "selected_r": int,
+            "manual_r": int or None,
+            "r_s": int,
+            "r_kappa": int,
+            "shared_rank": int,
+            "s_used": np.ndarray,
+            "kappa_used": np.ndarray,
+            "ce_by_r": dict[int, float],
+        }
+    """
+    s_vals = np.asarray(s_vals, dtype=float).ravel()
+    kappa_vals = np.asarray(kappa_vals, dtype=float).ravel()
+    if s_vals.ndim != 1 or kappa_vals.ndim != 1:
+        raise ValueError("s_vals 与 kappa_vals 必须是一维数组")
+
+    s_pos = np.sort(s_vals[s_vals > eps])[::-1]
+    kappa_pos = np.sort(kappa_vals[kappa_vals > eps])[::-1]
+    r_s = int(len(s_pos))
+    r_kappa = int(len(kappa_pos))
+    if r_s <= 0 or r_kappa <= 0:
+        raise ValueError("有效谱值数量为 0，无法计算 CE")
+
+    shared_rank = int(min(r_s, r_kappa))
+    if shared_rank <= 0:
+        raise ValueError("两组谱没有共享的有效维度，无法计算 CE")
+    n_dim = max(r_s, r_kappa) if dimension is None else int(dimension)
+    if n_dim <= 0:
+        raise ValueError("dimension 必须为正整数")
+
+    w_s = 0.5 - alpha / 4.0
+    w_k = alpha / 4.0
+
+    gamma_hat = float(
+        (
+            w_s * np.sum(np.log(np.maximum(s_pos, eps)))
+            + w_k * np.sum(np.log(np.maximum(kappa_pos, eps)))
+        )
+        / n_dim
+    )
+
+    def _gamma_hat_eps(r_now):
+        r_now = int(r_now)
+        return float(
+            (
+                w_s * np.sum(np.log(np.maximum(s_pos[:r_now], eps)))
+                + w_k * np.sum(np.log(np.maximum(kappa_pos[:r_now], eps)))
+            )
+            / r_now
+        )
+
+    ce_by_r = {}
+    for r_now in range(1, shared_rank + 1):
+        gamma_now = _gamma_hat_eps(r_now)
+        ce_by_r[r_now] = float(gamma_now - gamma_hat)
+
+    manual_r = None if r_eps is None else int(r_eps)
+    if manual_r is not None:
+        if manual_r < 1 or manual_r > shared_rank:
+            raise ValueError(f"r_eps 必须位于 [1, {shared_rank}]")
+        selected_r = manual_r
+    else:
+        selected_r = int(max(ce_by_r, key=ce_by_r.get))
+
+    gamma_hat_eps = _gamma_hat_eps(selected_r)
+    return {
+        "CE": float(gamma_hat_eps - gamma_hat),
+        "gamma_hat": gamma_hat,
+        "gamma_hat_eps": float(gamma_hat_eps),
+        "selected_r": int(selected_r),
+        "manual_r": manual_r,
+        "r_s": r_s,
+        "r_kappa": r_kappa,
+        "shared_rank": shared_rank,
+        "dimension": n_dim,
+        "s_used": np.real_if_close(s_pos),
+        "kappa_used": np.real_if_close(kappa_pos),
+        "ce_by_r": ce_by_r,
+    }
+
+
+def compute_ce_from_gis_metrics(metrics, r_eps=None, alpha=None, eps=1e-10):
+    """
+    基于 compute_gis_metrics 的输出直接计算谱定义下的 CE。
+
+    本函数用于解析实验或真值已知实验中，将
+    `compute_gis_metrics` 返回的前向/后向谱信息直接接到
+    `compute_ce_from_spectral_terms`，避免在 notebook 中反复手动取值。
+
+    Parameters
+    ----------
+    metrics : dict
+        `compute_gis_metrics` 的输出字典，至少应包含：
+        - "sv_backward"
+        - "sv_forward"
+        可选包含：
+        - "alpha"
+    r_eps : int or None, default=None
+        截断维度。若为 None，则自动选择 CE 最大的 r。
+    alpha : float or None, default=None
+        若为 None，则优先使用 metrics 中的 alpha；否则使用传入值。
+    eps : float, default=1e-10
+        数值稳定阈值。
+
+    Returns
+    -------
+    dict
+        `compute_ce_from_spectral_terms` 的返回结果，并额外附带：
+        {
+            ...,
+            "alpha": float,
+        }
+    """
+    if "sv_backward" not in metrics or "sv_forward" not in metrics:
+        raise ValueError("metrics 必须至少包含 'sv_backward' 与 'sv_forward'")
+
+    alpha_final = float(metrics.get("alpha", 1.0) if alpha is None else alpha)
+    result = compute_ce_from_spectral_terms(
+        metrics["sv_backward"],
+        metrics["sv_forward"],
+        r_eps=r_eps,
+        alpha=alpha_final,
+        eps=eps,
+        dimension=metrics.get("dimension"),
+    )
+    result["alpha"] = alpha_final
+    return result
+
+
 def plot_dual_gis_spectrum(
     forward_values,
     backward_values,
@@ -3650,7 +3940,13 @@ def build_w_from_svd(A, Sigma, r=None, alpha=1.0, eps=1e-10, mode='two_stage'):
     r : int or None
         宏观维度。若为 None，则根据 backward 奇异值谱自动选取。
     alpha : float, default=1.0
-        当前版本中保留该参数，便于后续按 alpha 加权扩展。
+        用于在 two_stage 模式下对两类谱做 alpha 加权。
+        记
+            w_s = 1/2 - alpha/4
+            w_k = alpha/4
+        则第一阶段分别使用
+            s_i^{w_s}, kappa_i^{w_k}
+        作为两类方向的加权强度。
     eps : float, default=1e-10
         数值阈值。
     mode : str, default='two_stage'
@@ -3699,7 +3995,15 @@ def build_w_from_svd(A, Sigma, r=None, alpha=1.0, eps=1e-10, mode='two_stage'):
         U_det, S_det, _ = np.linalg.svd(sigma_inv, full_matrices=False)
         U_nondeg, S_nondeg, _ = np.linalg.svd(backward, full_matrices=False)
 
-        combined_scores = np.concatenate([S_nondeg, S_det], axis=0)
+        w_s = 0.5 - alpha / 4.0
+        w_k = alpha / 4.0
+
+        # 方案 B：使用与 CE 一致的对数权重，将两类谱分别映射为
+        # s_i^{w_s} 与 kappa_i^{w_k}，再进入统一排序与第二次 SVD。
+        S_nondeg_weighted = np.exp(w_s * np.log(np.maximum(S_nondeg, eps)))
+        S_det_weighted = np.exp(w_k * np.log(np.maximum(S_det, eps)))
+
+        combined_scores = np.concatenate([S_nondeg_weighted, S_det_weighted], axis=0)
         combined_vectors = np.concatenate([U_nondeg, U_det], axis=1)
         source_labels = np.array(
             ['nondeg'] * len(S_nondeg) + ['det'] * len(S_det),
@@ -3740,6 +4044,8 @@ def build_w_from_svd(A, Sigma, r=None, alpha=1.0, eps=1e-10, mode='two_stage'):
             "sv_backward": np.real_if_close(sv_backward),
             "sv_det": np.real_if_close(S_det),
             "sv_nondeg": np.real_if_close(S_nondeg),
+            "sv_det_weighted": np.real_if_close(S_det_weighted),
+            "sv_nondeg_weighted": np.real_if_close(S_nondeg_weighted),
             "sv_all": np.real_if_close(S_all),
             "sv_stage2": np.real_if_close(S2),
         },
@@ -3756,6 +4062,9 @@ def build_w_from_svd(A, Sigma, r=None, alpha=1.0, eps=1e-10, mode='two_stage'):
             "source_bar": source_bar.tolist(),
         },
         "stage_info": {
+            "alpha": float(alpha),
+            "w_s": float(w_s),
+            "w_k": float(w_k),
             "eps": float(eps),
             "rank_stage1": int(U_bar.shape[1]),
             "rank_stage2_auto": rank_stage2_auto,
@@ -3819,6 +4128,63 @@ def build_w_from_evd(A, r=None, mode='eig_abs'):
         "r": r,
         "eigvals": np.real_if_close(eigvals_sorted),
         "eigvecs": np.real_if_close(eigvecs_sorted),
+    }
+
+
+def compute_macro_true_matrices(A, Sigma, W):
+    """
+    根据微观层真值矩阵与粗粒化矩阵构造宏观层真值矩阵。
+
+    对于观测层动力学
+
+        o_{t+1} = A o_t + eps_t,   eps_t ~ N(0, Sigma)
+
+    若宏观变量定义为
+
+        z_t = W o_t
+
+    则对应的宏观层真值矩阵为
+
+        A_macro = W A W^T
+        Sigma_macro = W Sigma W^T
+
+    Parameters
+    ----------
+    A : array-like of shape (m, m)
+        微观层动力学矩阵。
+    Sigma : array-like of shape (m, m)
+        微观层噪声协方差矩阵。
+    W : array-like of shape (r, m)
+        粗粒化矩阵。
+
+    Returns
+    -------
+    dict
+        {
+            "A_macro": np.ndarray of shape (r, r),
+            "Sigma_macro": np.ndarray of shape (r, r),
+            "macro_dim": int,
+            "micro_dim": int,
+        }
+    """
+    A = np.asarray(A, dtype=float)
+    Sigma = np.asarray(Sigma, dtype=float)
+    W = np.asarray(W, dtype=float)
+
+    if A.ndim != 2 or A.shape[0] != A.shape[1]:
+        raise ValueError("A 必须是方阵")
+    if Sigma.ndim != 2 or Sigma.shape != A.shape:
+        raise ValueError("Sigma 必须与 A 维度一致")
+    if W.ndim != 2 or W.shape[1] != A.shape[0]:
+        raise ValueError("W 必须是形状为 (r, m) 的二维数组，且列数与 A 的维度一致")
+
+    A_macro = W @ A @ W.T
+    Sigma_macro = W @ Sigma @ W.T
+    return {
+        "A_macro": np.real_if_close(A_macro),
+        "Sigma_macro": np.real_if_close(Sigma_macro),
+        "macro_dim": int(W.shape[0]),
+        "micro_dim": int(A.shape[0]),
     }
 
 
@@ -3921,3 +4287,186 @@ def summarize_pipeline_results(
     }
 
     return summary_dict, summary_row
+
+
+def _sparse_plot_labels(labels, step=1):
+    if labels is None:
+        return False
+    if step <= 1:
+        return labels
+    return [label if i % step == 0 else "" for i, label in enumerate(labels)]
+
+
+def _default_heatmap_cmap(matrix, cmap=None):
+    if cmap is not None:
+        return cmap
+    matrix = np.asarray(matrix, dtype=float)
+    if np.any(matrix < 0) and np.any(matrix > 0):
+        return "vlag"
+    return "Blues"
+
+
+def plot_matrix_heatmap(
+    matrix,
+    title,
+    row_labels=None,
+    col_labels=None,
+    center=0.0,
+    figsize=(6, 5),
+    cmap=None,
+    label_step=1,
+    square=None,
+):
+    """
+    绘制通用矩阵热力图。
+    """
+    matrix_arr = np.asarray(matrix, dtype=float)
+    final_cmap = _default_heatmap_cmap(matrix_arr, cmap=cmap)
+    final_center = center if final_cmap == "vlag" else None
+    if square is None:
+        square = matrix_arr.shape[0] == matrix_arr.shape[1]
+
+    try:
+        import seaborn as sns
+
+        fig, ax = plt.subplots(figsize=figsize)
+        sns.heatmap(
+            matrix_arr,
+            ax=ax,
+            cmap=final_cmap,
+            center=final_center,
+            square=square,
+            xticklabels=_sparse_plot_labels(col_labels, label_step),
+            yticklabels=_sparse_plot_labels(row_labels, label_step),
+        )
+        ax.set_title(title)
+        plt.tight_layout()
+        plt.show()
+    except ModuleNotFoundError:
+        fig, ax = plt.subplots(figsize=figsize)
+        image = ax.imshow(matrix_arr, cmap=final_cmap, aspect="auto")
+        plt.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_title(title)
+        if col_labels is not None:
+            ax.set_xticks(np.arange(len(col_labels)))
+            ax.set_xticklabels(_sparse_plot_labels(col_labels, label_step), rotation=90)
+        if row_labels is not None:
+            ax.set_yticks(np.arange(len(row_labels)))
+            ax.set_yticklabels(_sparse_plot_labels(row_labels, label_step))
+        plt.tight_layout()
+        plt.show()
+
+
+def standardize_for_plot(x, eps=1e-12):
+    """
+    对一维序列做零均值单位方差标准化，便于共图展示。
+    """
+    x = np.asarray(x, dtype=float)
+    return (x - np.mean(x)) / (np.std(x) + eps)
+
+
+def rollout_linear_gis(A, initial_state, steps, include_initial=True):
+    """
+    从单个初值出发，对线性 GIS 做自由滚动预测。
+    """
+    A = np.asarray(A, dtype=float)
+    current = np.asarray(initial_state, dtype=float).reshape(1, -1)
+    if A.ndim != 2 or A.shape[0] != A.shape[1]:
+        raise ValueError("A 必须是方阵")
+    if current.shape[1] != A.shape[0]:
+        raise ValueError("initial_state 的维度必须与 A 匹配")
+    if steps <= 0:
+        raise ValueError("steps 必须为正整数")
+
+    outputs = []
+    if include_initial:
+        outputs.append(current.ravel().copy())
+    for _ in range(int(steps)):
+        current = current @ A.T
+        outputs.append(current.ravel().copy())
+    return np.asarray(outputs, dtype=float)
+
+
+def plot_rollout_channel_comparison(
+    true_series,
+    pred_series,
+    channel_indices,
+    channel_labels=None,
+    title="True vs predicted rollout",
+    standardize=False,
+    figsize=(11, 4.5),
+    legend_ncol=2,
+):
+    """
+    对若干代表性通道绘制真实轨迹与自由滚动预测轨迹。
+    """
+    true_series = np.asarray(true_series, dtype=float)
+    pred_series = np.asarray(pred_series, dtype=float)
+    if true_series.ndim != 2 or pred_series.ndim != 2:
+        raise ValueError("true_series 和 pred_series 都必须是二维数组")
+    if true_series.shape != pred_series.shape:
+        raise ValueError("true_series 和 pred_series 的形状必须一致")
+
+    if channel_labels is None:
+        channel_labels = [f"channel {idx}" for idx in channel_indices]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    x = np.arange(true_series.shape[0])
+    for idx, label in zip(channel_indices, channel_labels):
+        true_vals = true_series[:, idx]
+        pred_vals = pred_series[:, idx]
+        if standardize:
+            true_vals = standardize_for_plot(true_vals)
+            pred_vals = standardize_for_plot(pred_vals)
+        ax.plot(x, true_vals, linewidth=1.8, label=f"true: {label}")
+        ax.plot(x, pred_vals, "--", linewidth=1.6, label=f"pred: {label}")
+
+    ax.set_title(title)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Value")
+    ax.legend(ncol=legend_ncol)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_singular_value_bar(values, title, top_k=None, color="tab:blue", figsize=(7.0, 4.0)):
+    """
+    用柱状图展示一组奇异值。
+    """
+    values = np.asarray(values, dtype=float).ravel()
+    if top_k is not None:
+        values = values[: int(top_k)]
+    x = np.arange(1, len(values) + 1)
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.bar(x, values, color=color, alpha=0.72)
+    ax.set_title(title)
+    ax.set_xlabel("Index")
+    ax.set_ylabel("Singular value")
+    plt.tight_layout()
+    plt.show()
+
+
+def compute_ce2_from_singular_values(singular_values, r, eps=1e-10):
+    """
+    计算经验型 CE2：前 r 个奇异值均值减去全部奇异值均值。
+    """
+    singular_values = np.asarray(singular_values, dtype=float).ravel()
+    singular_values = singular_values[np.isfinite(singular_values)]
+    if singular_values.size == 0:
+        raise ValueError("没有有效奇异值，无法计算 CE2")
+    r = int(r)
+    if r <= 0:
+        raise ValueError("r 必须为正整数")
+    r = min(r, singular_values.size)
+
+    top_r_mean = float(np.mean(singular_values[:r]))
+    full_mean = float(np.mean(singular_values))
+    ce2 = top_r_mean - full_mean
+    effective_rank = int(np.sum(singular_values > eps))
+    return {
+        "CE2": float(ce2),
+        "top_r_mean": top_r_mean,
+        "full_mean": full_mean,
+        "r": r,
+        "effective_rank": effective_rank,
+    }
